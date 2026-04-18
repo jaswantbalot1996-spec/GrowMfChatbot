@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: growmf-chatbot-api
+    runtime: python311
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 4 -b 0.0.0.0:$PORT phase_4_extended_coverage.api_server_phase4:app"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: PORT
+        value: 10000

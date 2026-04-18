@@ -1,0 +1,25 @@
+name: Deploy Backend to Render
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'phase_4_extended_coverage/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/deploy-backend.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Deploy to Render
+        run: |
+          curl -X POST \
+            -H "accept: application/json" \
+            -H "content-type: application/json" \
+            -H "authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            https://api.render.com/deploy/srv-${{ secrets.RENDER_SERVICE_ID }}?key=${{ secrets.RENDER_API_KEY }}

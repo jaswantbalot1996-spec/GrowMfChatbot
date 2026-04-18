@@ -110,7 +110,10 @@ except Exception as e:
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+
+# Configure CORS for production
+allowed_origins = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:8501').split(',')
+CORS(app, origins=allowed_origins, supports_credentials=True)
 
 # Initialize services
 translator = None

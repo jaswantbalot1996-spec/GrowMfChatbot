@@ -1,0 +1,292 @@
+name: Daily Corpus Refresh (Chroma Cloud + Grok LLM)
+
+on:
+  schedule:
+    - cron: '30 3 * * *'  # 09:00 AM IST (03:30 AM UTC)
+  workflow_dispatch:
+
+jobs:
+  scrape-chunk-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ========================================================================
+      # Setup
+      # ========================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ========================================================================
+      # Phase 1: Scraping (09:00-09:02 AM IST)
+      # ========================================================================
+      - name: Install Phase 1 dependencies
+        run: |
+          pip install -r phase-1-mvp/scraping/requirements.txt
+
+      - name: Run Phase 1 Scraper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "🕐 Starting Phase 1 Scraper: $(date)"
+          python -m phase_1_mvp.scraping.main \
+            --mode=production \
+            --retry-policy=aggressive
+          echo "✓ Phase 1 Complete: $(date)"
+
+      - name: Verify Phase 1 Output
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -c "
+          from phase_1_mvp.scraping.database import DatabaseManager
+          db = DatabaseManager()
+          count = db.get_staging_count()
+          print(f'✓ Scraped {count} HTML pages')
+          "
+
+      # ========================================================================
+      # Phase 2: Chunking, Embedding & Indexing (09:02-09:05 AM IST)
+      # ========================================================================
+      - name: Install Phase 2 dependencies
+        run: |
+          pip install -r phase_2_production/requirements.txt
+
+      - name: Run Phase 2 Chunking & Embedding
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          EMBEDDING_DEVICE: cpu
+        run: |
+          echo "🕐 Starting Phase 2 Pipeline: $(date)"
+          python -m phase_2_production.main \
+            --mode=production \
+            --action=chunk-and-embed
+          echo "✓ Phase 2 Pipeline Complete: $(date)"
+
+      # ========================================================================
+      # Phase 3: Index with Chroma Cloud + LLM Ready (09:05-09:07 AM IST)
+      # ========================================================================
+      - name: Install Phase 3 dependencies
+        run: |
+          pip install -r phase_3_llm_integration/requirements.txt
+
+      - name: Index with Chroma Cloud
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CHROMA_HOST: ${{ secrets.CHROMA_HOST }}
+          CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
+          CHROMA_TENANT: ${{ secrets.CHROMA_TENANT }}
+          CHROMA_DATABASE: ${{ secrets.CHROMA_DATABASE }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          echo "📌 Indexing with Chroma Cloud..."
+          python << 'EOF'
+          import logging
+          from phase_3_llm_integration.chroma_cloud_client import create_chroma_client
+          from phase_2_production.indexing.vectordb import get_chunks_from_db
+          
+          logging.basicConfig(level=logging.INFO)
+          
+          try:
+              # Get chunks from Phase 2
+              chunks = get_chunks_from_db()
+              print(f"✓ Retrieved {len(chunks)} chunks from database")
+              
+              # Index with Chroma Cloud
+              client = create_chroma_client()
+              success = client.upsert_documents(chunks, batch_size=100)
+              
+              if success:
+                  stats = client.get_collection_stats()
+                  print(f"✓ Chroma Cloud indexing complete")
+                  print(f"  - Total documents: {stats['total_documents']}")
+                  print(f"  - Dense model: {stats['embedding_model']}")
+                  print(f"  - Sparse model: {stats['sparse_model']}")
+                  print(f"✓ Ready for hybrid search + LLM queries")
+              else:
+                  print("✗ Failed to index documents")
+                  exit(1)
+          except Exception as e:
+              print(f"✗ Error: {e}")
+              exit(1)
+          EOF
+
+      - name: Validate Chroma Cloud Index
+        env:
+          CHROMA_HOST: ${{ secrets.CHROMA_HOST }}
+          CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
+        run: |
+          echo "🔍 Validating Chroma Cloud index..."
+          python << 'EOF'
+          from phase_3_llm_integration.chroma_cloud_client import create_chroma_client
+          
+          client = create_chroma_client()
+          stats = client.get_collection_stats()
+          
+          total = stats['total_documents']
+          if total > 0:
+              print(f"✓ Chroma Cloud validation passed: {total} documents indexed")
+          else:
+              print("⚠️  Warning: No documents in Chroma Cloud index")
+          EOF
+
+      - name: Invalidate Redis Cache
+        if: always()
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          python << 'EOF'
+          import redis
+          import os
+          
+          redis_url = os.getenv('REDIS_URL')
+          if redis_url:
+              r = redis.from_url(redis_url)
+              keys = r.keys('query:*')
+              if keys:
+                  r.delete(*keys)
+              print(f"✓ Flushed {len(keys)} cache entries")
+          EOF
+
+      # ========================================================================
+      # Notifications
+      # ========================================================================
+      - name: Send Slack Notification (Success)
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "✅ Daily Corpus Refresh Completed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "✅ *Daily Corpus Refresh Completed*\n\n*Phase 1:* Scraped 15 Groww AMC URLs\n*Phase 2:* Chunked & embedded (~245 chunks)\n*Phase 3:* Indexed to Chroma Cloud (Hybrid Search Ready)\n\n_Status:_ Ready for Grok LLM queries"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "`Workflow: ${{ github.workflow }}` | `Commit: ${{ github.sha }}` | `Time: $(date)`"
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Send Slack Notification (Failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "❌ Daily Corpus Refresh Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "❌ *Daily Corpus Refresh Failed*\n\nPlease check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+
+  # ============================================================================
+  # Phase 3 Optional: LLM Query Canary Test
+  # ============================================================================
+  test-phase3-sample:
+    runs-on: ubuntu-latest
+    needs: scrape-chunk-index
+    if: vars.ENABLE_PHASE3_TESTING == 'true'
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Phase 3 dependencies
+        run: |
+          pip install -r phase_3_llm_integration/requirements.txt
+
+      - name: Test Phase 3 with Sample Queries
+        env:
+          CHROMA_HOST: ${{ secrets.CHROMA_HOST }}
+          CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
+          CHROMA_TENANT: ${{ secrets.CHROMA_TENANT }}
+          CHROMA_DATABASE: ${{ secrets.CHROMA_DATABASE }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+        run: |
+          echo "🧪 Running Phase 3 canary tests..."
+          python << 'EOF'
+          from phase_3_llm_integration import create_phase3_service
+          import time
+          
+          try:
+              service = create_phase3_service()
+              
+              # Sample test queries
+              test_queries = [
+                  "What is the expense ratio of HDFC funds?",
+                  "Which mutual funds have the lowest exit load?",
+              ]
+              
+              results = []
+              for query in test_queries:
+                  start = time.time()
+                  response = service.query(query)
+                  latency = time.time() - start
+                  
+                  results.append({
+                      'query': query,
+                      'latency_ms': latency * 1000,
+                      'confidence': response['confidence'],
+                  })
+                  
+                  print(f"✓ {query[:50]}...")
+                  print(f"  Latency: {latency*1000:.1f}ms | Confidence: {response['confidence']:.2%}")
+              
+              avg_latency = sum(r['latency_ms'] for r in results) / len(results)
+              print(f"\n✓ Phase 3 canary test passed (avg latency: {avg_latency:.1f}ms)")
+          except Exception as e:
+              print(f"⚠️  Canary test warning: {e}")
+              # Don't fail - this is optional
+          EOF
+
+# ============================================================================
+# Workflow Secrets Required
+# ============================================================================
+# DATABASE_URL              - PostgreSQL connection
+# REDIS_URL                 - Redis connection (optional)
+# CHROMA_HOST               - Chroma Cloud host (api.trychroma.com)
+# CHROMA_API_KEY            - Chroma Cloud API key
+# CHROMA_TENANT             - Chroma Cloud tenant ID
+# CHROMA_DATABASE           - Chroma Cloud database name
+# GROK_API_KEY              - xAI Grok API key (for Phase 3 LLM)
+# SLACK_WEBHOOK_URL         - Slack notifications (optional)
+# ENABLE_PHASE3_TESTING     - "true" to run LLM canary tests

@@ -1,0 +1,598 @@
+name: Phase 4 - Daily Extended Coverage Scrape
+
+on:
+  schedule:
+    # 9:00 AM IST = 03:30 AM UTC
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Scrape specific tier or all'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - tier1
+          - tier2
+          - tier3
+          - tier4
+
+env:
+  CHROMA_DB_URL: ${{ secrets.CHROMA_DB_URL }}
+  CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
+  GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+  GOOGLE_TRANSLATE_API_KEY: ${{ secrets.GOOGLE_TRANSLATE_API_KEY }}
+  POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+  REDIS_URL: ${{ secrets.REDIS_URL }}
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-1
+
+jobs:
+  
+  # Job 1: Tier 1 (Large AMCs) - 5 URLs
+  scrape-tier1:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' || 
+      github.event.inputs.tier == 'all' || 
+      github.event.inputs.tier == 'tier1'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install google-cloud-translate redis pyyaml
+      
+      - name: Fetch Tier 1 URLs (HDFC, ICICI, SBI, Axis, Kotak)
+        id: fetch-tier1
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from phase_4_extended_coverage.amc_config import AMC_CONFIG
+          urls = AMC_CONFIG.get('tier1', {})
+          print(f'::set-output name=count::{len(urls)}')
+          print(f'Tier 1 contains {len(urls)} URLs')
+          for amc, url in urls.items():
+              print(f'  - {amc}: {url}')
+          "
+      
+      - name: Parse & Chunk Tier 1 Content
+        id: chunk-tier1
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_1_data_scraper.scraper_v2 import scrape_urls
+          from phase_2_chunking.chunker import chunk_documents
+          from phase_4_extended_coverage.amc_config import AMC_CONFIG
+          
+          # Fetch URLs
+          urls = AMC_CONFIG.get('tier1', {})
+          docs = scrape_urls(urls, max_workers=5, timeout=30)
+          print(f'Fetched {len(docs)} documents from Tier 1')
+          
+          # Chunk
+          chunks = chunk_documents(docs, chunk_size=400, chunk_overlap=50)
+          print(f'Generated {len(chunks)} chunks')
+          print(f'::set-output name=chunk_count::{len(chunks)}')
+          
+          with open('/tmp/tier1_chunks.json', 'w') as f:
+              json.dump([{
+                  'content': c.get('content'),
+                  'metadata': c.get('metadata'),
+                  'tier': 'tier1'
+              } for c in chunks], f)
+          "
+      
+      - name: Generate Embeddings (Tier 1)
+        id: embed-tier1
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.embedder import embed_chunks
+          
+          with open('/tmp/tier1_chunks.json', 'r') as f:
+              chunks = json.load(f)
+          
+          # Embed using sentence-transformers
+          embeddings = embed_chunks(chunks, model_name='all-mpnet-base-v2', batch_size=100)
+          print(f'Generated {len(embeddings)} embeddings')
+          
+          with open('/tmp/tier1_embeddings.json', 'w') as f:
+              json.dump(embeddings, f)
+          "
+      
+      - name: Translate Chunks to Hindi (Tier 1)
+        id: translate-tier1
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_4_extended_coverage.translation_service import create_translator, Language
+          
+          translator = create_translator(use_cache=True)
+          
+          with open('/tmp/tier1_chunks.json', 'r') as f:
+              chunks = json.load(f)
+          
+          for chunk in chunks:
+              # Translate content
+              chunk['content_hi'] = translator.translate_text(
+                  chunk['content'],
+                  Language.HINDI
+              )
+              # Translate metadata fields
+              if 'amc_name' in chunk['metadata']:
+                  chunk['metadata']['amc_name_hi'] = translator.translate_text(
+                      chunk['metadata']['amc_name'],
+                      Language.HINDI
+                  )
+          
+          print(f'Translated {len(chunks)} chunks to Hindi')
+          
+          with open('/tmp/tier1_translated.json', 'w') as f:
+              json.dump(chunks, f)
+          "
+      
+      - name: Index to Chroma Cloud (Tier 1)
+        id: index-tier1
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.chroma_handler import ChromaHandler
+          
+          handler = ChromaHandler()
+          
+          with open('/tmp/tier1_embeddings.json', 'r') as f:
+              embeddings = json.load(f)
+          
+          # Index English
+          handler.index_chunks(
+              embeddings,
+              collection='groww_funds_en',
+              tier='tier1'
+          )
+          
+          # Index Hindi (with translated content)
+          with open('/tmp/tier1_translated.json', 'r') as f:
+              translated = json.load(f)
+          
+          for item in translated:
+              item['content'] = item.get('content_hi', item['content'])
+          
+          handler.index_chunks(translated, collection='groww_funds_hi', tier='tier1')
+          print('Indexed Tier 1 to Chroma Cloud (English + Hindi)')
+          "
+      
+      - name: Validate Tier 1 Indexing
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.chroma_handler import ChromaHandler
+          
+          handler = ChromaHandler()
+          stats_en = handler.get_collection_stats('groww_funds_en')
+          stats_hi = handler.get_collection_stats('groww_funds_hi')
+          
+          print(f'✅ Tier 1 indexed - EN: {stats_en[\"count\"]} docs, HI: {stats_hi[\"count\"]} docs')
+          
+          assert stats_en['count'] > 0, 'No English docs indexed'
+          assert stats_hi['count'] > 0, 'No Hindi docs indexed'
+          "
+      
+      - name: Log Tier 1 Completion
+        if: always()
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from phase_1_data_scraper.logger import log_scrape_event
+          
+          log_scrape_event({
+              'tier': 'tier1',
+              'status': 'completed',
+              'chunk_count': ${{ steps.chunk-tier1.outputs.chunk_count }},
+              'timestamp': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+              'job_id': '\${{ github.run_id }}'
+          })
+          "
+
+  # Job 2: Tier 2 (Mid-cap AMCs) - 7 URLs
+  scrape-tier2:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' || 
+      github.event.inputs.tier == 'all' || 
+      github.event.inputs.tier == 'tier2'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install google-cloud-translate redis pyyaml
+      
+      - name: Scrape Tier 2 (Motilal, UTI, Nippon, Aditya, Invesco, ICICI Pru, Canara)
+        run: |
+          python phase_4_extended_coverage/scraper_tier.py tier2 \
+            --chunk-size 400 \
+            --output /tmp/tier2_data.json
+
+      - name: Embed Tier 2
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.embedder import embed_chunks
+          
+          with open('/tmp/tier2_data.json', 'r') as f:
+              data = json.load(f)
+          
+          embeddings = embed_chunks(data['chunks'], model_name='all-mpnet-base-v2')
+          with open('/tmp/tier2_embeddings.json', 'w') as f:
+              json.dump(embeddings, f)
+          print(f'Embedded {len(embeddings)} Tier 2 chunks')
+          "
+      
+      - name: Translate Tier 2
+        run: |
+          python phase_4_extended_coverage/translator.py \
+            --input /tmp/tier2_embeddings.json \
+            --output /tmp/tier2_translated.json \
+            --target-language hi
+
+      - name: Index Tier 2 to Chroma
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.chroma_handler import ChromaHandler
+          
+          handler = ChromaHandler()
+          
+          with open('/tmp/tier2_embeddings.json', 'r') as f:
+              en_data = json.load(f)
+          with open('/tmp/tier2_translated.json', 'r') as f:
+              hi_data = json.load(f)
+          
+          handler.index_chunks(en_data, 'groww_funds_en', tier='tier2')
+          handler.index_chunks(hi_data, 'groww_funds_hi', tier='tier2')
+          print('✅ Tier 2 indexed (EN + HI)')
+          "
+
+      - name: Log Tier 2
+        if: always()
+        run: |
+          python phase_4_extended_coverage/logger.py --tier tier2 --status completed
+
+  # Job 3: Tier 3 (Emerging AMCs) - 11 URLs
+  scrape-tier3:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' || 
+      github.event.inputs.tier == 'all' || 
+      github.event.inputs.tier == 'tier3'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install google-cloud-translate redis pyyaml
+
+      - name: Scrape Tier 3 (11 URLs)
+        run: |
+          python phase_4_extended_coverage/scraper_tier.py tier3 \
+            --chunk-size 400 \
+            --output /tmp/tier3_data.json
+      
+      - name: Embed Tier 3
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.embedder import embed_chunks
+          
+          with open('/tmp/tier3_data.json', 'r') as f:
+              data = json.load(f)
+          
+          embeddings = embed_chunks(data['chunks'], model_name='all-mpnet-base-v2', batch_size=100)
+          with open('/tmp/tier3_embeddings.json', 'w') as f:
+              json.dump(embeddings, f)
+          print(f'✅ Embedded {len(embeddings)} Tier 3 chunks')
+          "
+      
+      - name: Translate Tier 3
+        run: |
+          python phase_4_extended_coverage/translator.py \
+            --input /tmp/tier3_embeddings.json \
+            --output /tmp/tier3_translated.json \
+            --target-language hi
+      
+      - name: Index Tier 3
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.chroma_handler import ChromaHandler
+          
+          handler = ChromaHandler()
+          
+          with open('/tmp/tier3_embeddings.json', 'r') as f:
+              en_data = json.load(f)
+          with open('/tmp/tier3_translated.json', 'r') as f:
+              hi_data = json.load(f)
+          
+          handler.index_chunks(en_data, 'groww_funds_en', tier='tier3')
+          handler.index_chunks(hi_data, 'groww_funds_hi', tier='tier3')
+          print('✅ Tier 3 indexed (EN + HI)')
+          "
+
+      - name: Log Tier 3
+        if: always()
+        run: |
+          python phase_4_extended_coverage/logger.py --tier tier3 --status completed
+
+  # Job 4: Tier 4 (Categories) - 3 URLs
+  scrape-tier4:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' || 
+      github.event.inputs.tier == 'all' || 
+      github.event.inputs.tier == 'tier4'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install google-cloud-translate redis
+
+      - name: Scrape Tier 4 (Category pages)
+        run: |
+          python phase_4_extended_coverage/scraper_tier.py tier4 \
+            --chunk-size 400 \
+            --output /tmp/tier4_data.json
+      
+      - name: Embed Tier 4
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.embedder import embed_chunks
+          
+          with open('/tmp/tier4_data.json', 'r') as f:
+              data = json.load(f)
+          
+          embeddings = embed_chunks(data['chunks'])
+          with open('/tmp/tier4_embeddings.json', 'w') as f:
+              json.dump(embeddings, f)
+          print(f'✅ Embedded {len(embeddings)} Tier 4 chunks')
+          "
+      
+      - name: Translate Tier 4
+        run: |
+          python phase_4_extended_coverage/translator.py \
+            --input /tmp/tier4_embeddings.json \
+            --output /tmp/tier4_translated.json
+      
+      - name: Index Tier 4
+        run: |
+          python -c "
+          import sys, json
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.chroma_handler import ChromaHandler
+          
+          handler = ChromaHandler()
+          
+          with open('/tmp/tier4_embeddings.json', 'r') as f:
+              en_data = json.load(f)
+          with open('/tmp/tier4_translated.json', 'r') as f:
+              hi_data = json.load(f)
+          
+          handler.index_chunks(en_data, 'groww_funds_en', tier='tier4')
+          handler.index_chunks(hi_data, 'groww_funds_hi', tier='tier4')
+          print('✅ Tier 4 indexed (EN + HI)')
+          "
+
+      - name: Log Tier 4
+        if: always()
+        run: |
+          python phase_4_extended_coverage/logger.py --tier tier4 --status completed
+
+  # Job 5: Post-Processing (runs after all tiers complete)
+  post-process:
+    runs-on: ubuntu-latest
+    needs: [scrape-tier1, scrape-tier2, scrape-tier3, scrape-tier4]
+    if: always()  # Run even if some tiers fail
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install redis pyyaml boto3
+
+      - name: Invalidate Translation Cache
+        run: |
+          python -c "
+          import sys, redis
+          sys.path.insert(0, '.')
+          
+          r = redis.Redis.from_url('\${{ env.REDIS_URL }}')
+          cursor = 0
+          pattern = 'translation:*'
+          
+          while True:
+              cursor, keys = r.scan(cursor, match=pattern, count=100)
+              if keys:
+                  r.delete(*keys)
+              if cursor == 0:
+                  break
+          
+          print('✅ Translation cache invalidated')
+          "
+
+      - name: Verify Indexing
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from phase_3_retrieval.chroma_handler import ChromaHandler
+          
+          handler = ChromaHandler()
+          stats_en = handler.get_collection_stats('groww_funds_en')
+          stats_hi = handler.get_collection_stats('groww_funds_hi')
+          
+          total_en = stats_en['count']
+          total_hi = stats_hi['count']
+          
+          print(f'📊 Total indexed:')
+          print(f'   English: {total_en} documents')
+          print(f'   Hindi: {total_hi} documents')
+          print(f'   Language ratio: {total_hi/total_en:.2%}')
+          
+          assert total_en > 500, f'Low English doc count: {total_en}'
+          assert total_hi > 400, f'Low Hindi doc count: {total_hi}'
+          "
+
+      - name: Upload Logs to S3
+        if: always()
+        run: |
+          python -c "
+          import sys, json, boto3
+          from datetime import datetime
+          sys.path.insert(0, '.')
+          
+          s3 = boto3.client('s3')
+          timestamp = datetime.now().isoformat()
+          
+          log_file = f'phase4-scrapes/\${{ github.run_id }}-{timestamp}.json'
+          
+          with open('/tmp/phase4_scrape_logs.json', 'w') as f:
+              json.dump({
+                  'run_id': '\${{ github.run_id }}',
+                  'timestamp': timestamp,
+                  'job_status': '\${{ job.status }}',
+                  'tier1': '\${{ needs.scrape-tier1.result }}',
+                  'tier2': '\${{ needs.scrape-tier2.result }}',
+                  'tier3': '\${{ needs.scrape-tier3.result }}',
+                  'tier4': '\${{ needs.scrape-tier4.result }}'
+              }, f)
+          
+          s3.upload_file('/tmp/phase4_scrape_logs.json', 'growmf-chatbot', log_file)
+          print(f'✅ Logs uploaded to S3: {log_file}')
+          "
+
+      - name: Slack Notification - Success
+        if: success()
+        run: |
+          python -c "
+          import json, urllib.request
+          
+          payload = {
+              'text': '✅ Phase 4 Daily Scrape Complete',
+              'blocks': [
+                  {
+                      'type': 'header',
+                      'text': {'type': 'plain_text', 'text': '🎉 Phase 4 Extended Coverage Updated'}
+                  },
+                  {
+                      'type': 'section',
+                      'fields': [
+                          {'type': 'mrkdwn', 'text': '*Status*\n✅ Success'},
+                          {'type': 'mrkdwn', 'text': '*Coverage*\nTier 1-4 (38 URLs)'},
+                          {'type': 'mrkdwn', 'text': '*Languages*\n🇬🇧 English + 🇮🇳 Hindi'},
+                          {'type': 'mrkdwn', 'text': '*Timestamp*\n\${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}'}
+                      ]
+                  }
+              ]
+          }
+          
+          req = urllib.request.Request(
+              '\${{ env.SLACK_WEBHOOK }}',
+              data=json.dumps(payload).encode('utf-8'),
+              headers={'Content-Type': 'application/json'}
+          )
+          urllib.request.urlopen(req)
+          print('✅ Slack notification sent')
+          "
+
+      - name: Slack Notification - Failure
+        if: failure()
+        run: |
+          python -c "
+          import json, urllib.request
+          
+          payload = {
+              'text': '❌ Phase 4 Daily Scrape Failed',
+              'blocks': [
+                  {
+                      'type': 'header',
+                      'text': {'type': 'plain_text', 'text': '⚠️ Phase 4 Scrape Error'}
+                  },
+                  {
+                      'type': 'section',
+                      'text': {'type': 'mrkdwn', 'text': 'Check logs: \${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}'}
+                  }
+              ]
+          }
+          
+          req = urllib.request.Request(
+              '\${{ env.SLACK_WEBHOOK }}',
+              data=json.dumps(payload).encode('utf-8'),
+              headers={'Content-Type': 'application/json'}
+          )
+          urllib.request.urlopen(req)
+          "

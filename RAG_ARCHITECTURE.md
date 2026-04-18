@@ -1258,7 +1258,7 @@ Parsed Chunks
 
 ### Phase 3: ✅ Hybrid Search + LLM Integration (Current) - COMPLETED
 
-**Objective**: Implement Chroma Cloud + Grok LLM for production queries
+**Objective**: Implement Chroma Cloud + Ollama LLM for production queries
 
 **Deliverables**:
 
@@ -1296,12 +1296,12 @@ Query: "What is the expense ratio of ELSS?"
     └─ Time: <10ms
 ```
 
-#### 3.3 Grok LLM Integration (xAI)
-- Model: Grok 2 (`grok-2`)
-- API: `https://api.x.ai/v1/chat/completions`
+#### 3.3 Ollama LLM Integration (Local)
+- Model: `llama3.2:latest` (running locally on port 11434)
+- API: `http://localhost:11434/api/generate`
 - Temperature: 0.1 (deterministic, fact-focused)
 - Max tokens: 150 (enforce brevity)
-- Response time: 300–1000ms
+- Response time: 500–1500ms (local inference, CPU/GPU dependent)
 
 **Generation Pipeline**:
 ```
@@ -1314,10 +1314,10 @@ Top-5 Context Chunks
     ├─ Output format: ≤3 sentences + source URL
     └─ Temperature: 0.1
     ↓
-[Token Generation] (Grok API)
+[Token Generation] (Ollama API)
     ├─ Max tokens: 150
     ├─ Stop sequences: ["Q:", "Note:", "Source:"]
-    └─ Time: 300–1000ms
+    └─ Time: 500–1500ms (local inference)
     ↓
 [Post-processing]
     ├─ Extract URL (regex validation)
@@ -1402,7 +1402,7 @@ Data Collection
 ### Phase 6: Fine-tuning & Optimization (Planned)
 
 **Goals**:
-- Fine-tune Grok on Groww-specific terminology
+- Fine-tune Ollama on Groww-specific terminology
 - Optimize chunk size for query success rate
 - Implement response caching (Redis)
 - Load testing & autoscaling

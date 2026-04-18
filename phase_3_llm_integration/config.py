@@ -50,7 +50,7 @@ SPARSE_EMBEDDING_MODEL = "chroma-cloud-splade"
 
 LLM_PROVIDER = "ollama"  # Using Ollama (local LLM)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")  # Ollama model name
-GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "2048"))  # Reused for token limit
+GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "150"))  # Max tokens (reduced from 2048 for faster responses; enforce ≤3 sentences)
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.1"))  # Low temp for factual accuracy
 
 # ============================================================================
